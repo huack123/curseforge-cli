@@ -311,13 +311,184 @@ def github_pick(repo, version=None, loader=None, channel=None):
     return None
 
 
-def pick_any(mod, version=None, loader=None, channel=None):
+def cf_candidates(mod_id):
+    files = api(f"/mods/{mod_id}/files", {"pageSize": 50})["data"]
+    out = []
+    for f in files:
+        versions = f.get("gameVersions") or []
+        out.append({
+            "source": "curseforge", "modId": mod_id, "id": f["id"],
+            "fileName": f["fileName"], "displayName": f["displayName"],
+            "fileLength": f.get("fileLength"), "hashes": f.get("hashes") or [],
+            "downloadUrl": f.get("downloadUrl"), "description": "",
+            "channel": RELEASE.get(f.get("releaseType")),
+            "game_versions": versions,
+            "loaders": [v.lower() for v in versions if v.lower() in LOADERS],
+            "date": f.get("fileDate", ""),
+            "dependencies": [{"source": "curseforge", "id": d["modId"], "required": True}
+                             for d in f.get("dependencies") or [] if d.get("relationType") == 3],
+        })
+    out.sort(key=lambda c: c["date"], reverse=True)
+    return out
+
+
+def mr_candidates(project_id):
+    versions = modrinth(f"/project/{urllib.parse.quote(str(project_id))}/version", soft=True) or []
+    out = []
+    for v in versions:
+        files = v.get("files") or []
+        if not files:
+            continue
+        f = next((x for x in files if x.get("primary")), files[0])
+        out.append({
+            "source": "modrinth", "modId": project_id, "id": v["id"],
+            "fileName": f["filename"], "displayName": v.get("name") or f["filename"],
+            "fileLength": f.get("size"), "url": f["url"],
+            "hashes": [{"algo": 1, "value": (f.get("hashes") or {}).get("sha1", "")}],
+            "description": v.get("changelog") or "",
+            "channel": v.get("version_type"),
+            "game_versions": v.get("game_versions") or [],
+            "loaders": v.get("loaders") or [],
+            "date": v.get("date_published", ""),
+            "dependencies": [{"source": "modrinth", "id": d["project_id"], "required": True}
+                             for d in v.get("dependencies") or []
+                             if d.get("dependency_type") == "required" and d.get("project_id")],
+        })
+    out.sort(key=lambda c: c["date"], reverse=True)
+    return out
+
+
+def gh_candidates(repo):
+    releases = github(f"/repos/{repo}/releases", {"per_page": 30}, soft=True) or []
+    out = []
+    for r in releases:
+        for asset in r.get("assets") or []:
+            name = asset.get("name", "")
+            if not name.lower().endswith(".jar"):
+                continue
+            out.append({
+                "source": "github", "modId": repo, "id": r["id"],
+                "fileName": name, "displayName": r.get("name") or name,
+                "fileLength": asset.get("size"), "url": asset["browser_download_url"],
+                "hashes": [], "description": r.get("body") or "",
+                "channel": "beta" if r.get("prerelease") else "release",
+                "game_versions": [], "loaders": [],
+                "date": r.get("published_at") or "",
+                "dependencies": [],
+            })
+    out.sort(key=lambda c: c["date"], reverse=True)
+    return out
+
+
+def candidates(mod):
     source = mod.get("source", "curseforge")
     if source == "modrinth":
-        return modrinth_pick(mod["id"], version, loader, channel)
+        return mr_candidates(mod["id"])
     if source == "github":
-        return github_pick(mod["id"], version, loader, channel)
-    return pick_file(mod["id"], version, loader, channel)
+        return gh_candidates(mod["id"])
+    return cf_candidates(mod["id"])
+
+
+VERSION_GROUPS = None
+
+
+def version_groups():
+    global VERSION_GROUPS
+    if VERSION_GROUPS is None:
+        tags = modrinth("/tag/game_version", soft=True) or []
+        groups, current = [], []
+        for tag in tags:
+            if tag.get("version_type") != "release":
+                continue
+            current.append(tag["version"])
+            if tag.get("major"):
+                groups.append(current)
+                current = []
+        if current:
+            groups.append(current)
+        VERSION_GROUPS = groups
+    return VERSION_GROUPS
+
+
+def version_in_text(version, text):
+    return re.search(rf"(?<![\d.]){re.escape(version)}(?![\d.])", text) is not None
+
+
+def haystack(c):
+    return f"{c['fileName']} {c['displayName']} {c.get('description', '')}".lower()
+
+
+def filter_indices(cands, filt):
+    kind, value = filt["type"], filt["value"]
+    if kind in ("GameVersionStrict", "GameVersionMinor"):
+        wanted = set(value)
+        if kind == "GameVersionMinor":
+            wanted = set()
+            for group in version_groups():
+                if set(value) & set(group):
+                    wanted.update(group)
+        return {i for i, c in enumerate(cands)
+                if wanted & set(c["game_versions"])
+                or (c["source"] == "github" and any(version_in_text(v, haystack(c)) for v in wanted))}
+    if kind in ("ModLoaderAny", "ModLoaderPrefer"):
+        return {i for i, c in enumerate(cands)
+                if set(value) & set(c["loaders"])
+                or (c["source"] == "github" and any(v.lower() in haystack(c) for v in value))}
+    if kind == "ReleaseChannel":
+        order = {"release": 1, "beta": 2, "alpha": 3}
+        limit = order.get(value, 3)
+        return {i for i, c in enumerate(cands) if order.get(c.get("channel"), 1) <= limit}
+    if kind in ("Filename", "Title", "Description"):
+        field = {"Filename": "fileName", "Title": "displayName", "Description": "description"}[kind]
+        try:
+            pattern = re.compile(value)
+        except re.error as exc:
+            sys.exit(f"Invalid {kind} regex: {exc}")
+        return {i for i, c in enumerate(cands) if pattern.search(c.get(field) or "")}
+    sys.exit(f"Unknown filter type {kind!r}")
+
+
+def select_candidates(cands, filters):
+    indices = set(range(len(cands)))
+    prefer = []
+    for filt in filters:
+        if filt["type"] == "ModLoaderPrefer":
+            prefer.append(filt)
+        else:
+            indices &= filter_indices(cands, filt)
+    for filt in prefer:
+        for loader in filt["value"]:
+            hit = {i for i in indices
+                   if loader in cands[i]["loaders"]
+                   or (cands[i]["source"] == "github" and loader in haystack(cands[i]))}
+            if hit:
+                indices = hit
+                break
+        else:
+            indices = set()
+    return cands[min(indices)] if indices else None
+
+
+def pick_any(mod, version=None, loader=None, channel=None, filters=None):
+    active = list(filters or [])
+    if version:
+        active.append({"type": "GameVersionStrict", "value": [version]})
+    if loader:
+        active.append({"type": "ModLoaderPrefer", "value": [loader]})
+    if channel:
+        active.append({"type": "ReleaseChannel", "value": channel})
+    return select_candidates(candidates(mod), active)
+
+
+def profile_filters(prof):
+    filters = list(prof.get("filters") or [])
+    if prof.get("version"):
+        filters.append({"type": "GameVersionStrict", "value": [prof["version"]]})
+    if prof.get("loader"):
+        filters.append({"type": "ModLoaderPrefer", "value": [prof["loader"]]})
+    if prof.get("channel"):
+        filters.append({"type": "ReleaseChannel", "value": prof["channel"]})
+    return filters
 
 
 def normalize_mod(mod):
@@ -333,6 +504,19 @@ def sha1_of(path):
     return digest.hexdigest()
 
 
+def fetch_to(url, dest, sha1=None):
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        urllib.request.urlretrieve(url, dest)
+    except (urllib.error.URLError, urllib.error.ContentTooShortError, OSError) as exc:
+        sys.exit(f"Download failed for {dest.name}: {exc}")
+    if sha1 and sha1_of(dest) != sha1.lower():
+        dest.unlink()
+        sys.exit(f"Checksum mismatch for {dest.name} (expected sha1 {sha1})")
+    return dest
+
+
 def download_file(file_info, out):
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
@@ -341,16 +525,8 @@ def download_file(file_info, out):
         url = api(f"/mods/{file_info['modId']}/files/{file_info['id']}/download-url")["data"]
     if not url:
         sys.exit(f"No download URL for {file_info.get('displayName')} (author disabled third-party downloads).")
-    dest = out / Path(file_info["fileName"]).name
-    try:
-        urllib.request.urlretrieve(url, dest)
-    except (urllib.error.URLError, urllib.error.ContentTooShortError, OSError) as exc:
-        sys.exit(f"Download failed for {dest.name}: {exc}")
-    expected = next((h["value"].lower() for h in file_info.get("hashes") or [] if h.get("algo") == 1), None)
-    if expected and sha1_of(dest) != expected:
-        dest.unlink()
-        sys.exit(f"Checksum mismatch for {dest.name} (expected sha1 {expected})")
-    return dest
+    expected = next((h["value"] for h in file_info.get("hashes") or [] if h.get("algo") == 1), None)
+    return fetch_to(url, out / Path(file_info["fileName"]).name, expected)
 
 
 def default_mods_dir():
@@ -432,16 +608,53 @@ def cmd_auth(args):
     print(f"Saved API key to {CONFIG}")
 
 
+def prompt(text, default=""):
+    if not sys.stdin.isatty():
+        return default
+    try:
+        return input(text).strip() or default
+    except (EOFError, KeyboardInterrupt):
+        return default
+
+
+def parse_filter(text):
+    if "=" not in text:
+        sys.exit(f"Filter must be Type=Value: {text!r}")
+    kind, value = text.split("=", 1)
+    kind = kind.strip()
+    if kind in ("GameVersionStrict", "GameVersionMinor", "ModLoaderPrefer", "ModLoaderAny"):
+        return {"type": kind, "value": [v.strip() for v in value.split(",") if v.strip()]}
+    if kind == "ReleaseChannel":
+        value = value.strip().lower()
+        if value not in ("release", "beta", "alpha"):
+            sys.exit("ReleaseChannel must be release, beta, or alpha")
+        return {"type": kind, "value": value}
+    if kind in ("Filename", "Title", "Description"):
+        return {"type": kind, "value": value}
+    sys.exit(f"Unknown filter type {kind!r}")
+
+
 def cmd_profile_create(args):
     cfg = load_config()
     profiles = cfg.setdefault("profiles", {})
+    if not args.name:
+        args.name = prompt("Profile name: ")
+        if not args.name:
+            sys.exit("A profile name is required")
     if args.name in profiles:
         sys.exit(f"Profile {args.name!r} already exists")
+    if args.version is None:
+        args.version = prompt("Minecraft version (e.g. 1.21.1): ") or None
+    if args.loader is None:
+        args.loader = prompt("Mod loader [forge/fabric/neoforge/quilt]: ").lower() or None
+        if args.loader and args.loader not in LOADERS:
+            sys.exit(f"Unknown loader {args.loader!r}")
     profiles[args.name] = {
         "game": args.game,
         "version": args.version,
         "loader": args.loader,
         "channel": None if args.channel == "any" else args.channel,
+        "filters": [parse_filter(f) for f in args.filter],
         "dir": str(Path(args.dir or default_mods_dir()).resolve()),
         "mods": [],
     }
@@ -476,6 +689,10 @@ def cmd_profile_configure(args):
         prof["dir"] = str(Path(args.dir).resolve())
     if args.channel is not None:
         prof["channel"] = None if args.channel == "any" else args.channel
+    if args.clear_filters:
+        prof["filters"] = []
+    if args.filter:
+        prof.setdefault("filters", []).extend(parse_filter(f) for f in args.filter)
     save_config(cfg)
     print(f"Configured profile {name!r}")
 
@@ -515,7 +732,7 @@ def cmd_profile_delete(args):
 
 def cmd_add(args):
     name, cfg, prof = active_profile(args)
-    version, loader, channel = prof.get("version"), prof.get("loader"), prof.get("channel")
+    filters = profile_filters(prof)
     mods = prof.setdefault("mods", [])
     added = 0
     for value in args.mods:
@@ -524,9 +741,9 @@ def cmd_add(args):
         if any((m.get("source", "curseforge"), str(m["id"])) == key for m in mods):
             print(f"have     {mod['name']}")
             continue
-        if not args.force and not pick_any(mod, version, loader, channel):
-            print(f"skip     {mod['name']}: no file for {version or 'any version'}/"
-                  f"{loader or 'any loader'} (use --force)")
+        if not args.force and not pick_any(mod, filters=filters):
+            print(f"skip     {mod['name']}: no compatible file "
+                  f"(use --force to add anyway)")
             continue
         mods.append(normalize_mod(mod))
         added += 1
@@ -569,7 +786,7 @@ def cmd_list(args):
     if args.verbose:
         rows = []
         for m in mods:
-            latest = pick_any(m, prof.get("version"), prof.get("loader"), prof.get("channel"))
+            latest = pick_any(m, filters=profile_filters(prof))
             rows.append([m["source"], m["id"], m.get("name", ""),
                          latest["fileName"] if latest else "-"])
         table(["Source", "ID", "Name", "Latest file"], rows)
@@ -588,7 +805,7 @@ def cmd_upgrade(args):
     if not mods:
         sys.exit(f"Profile {name!r} has no mods. Add some: cf add <mod>")
 
-    channel = prof.get("channel")
+    filters = profile_filters(prof)
     queue = [normalize_mod(m) for m in mods]
     seen, plan, filenames = set(), [], set()
     while queue:
@@ -597,7 +814,7 @@ def cmd_upgrade(args):
         if key in seen:
             continue
         seen.add(key)
-        f = pick_any(mod, version, loader, channel)
+        f = pick_any(mod, filters=filters)
         if not f:
             print(f"skip     {mod.get('name') or mod['id']}: no file for "
                   f"{version or 'any version'}/{loader or 'any loader'}")
@@ -793,7 +1010,11 @@ def cmd_install(args):
     prof = profile_defaults()
     version = args.version or prof.get("version")
     loader = args.loader or prof.get("loader")
-    channel = prof.get("channel")
+    filters = profile_filters(prof)
+    if args.version:
+        filters.append({"type": "GameVersionStrict", "value": [args.version]})
+    if args.loader:
+        filters.append({"type": "ModLoaderPrefer", "value": [args.loader]})
     out = Path(args.dir or prof.get("dir") or default_mods_dir())
     queue = [resolve_any(args.mod, args.source, args.game)]
     seen = set()
@@ -803,7 +1024,7 @@ def cmd_install(args):
         if key in seen:
             continue
         seen.add(key)
-        f = pick_any(mod, version, loader, channel)
+        f = pick_any(mod, filters=filters)
         if not f:
             print(f"skip     {mod.get('name') or mod['id']}: no file for "
                   f"{version or 'any version'}/{loader or 'any loader'}")
@@ -889,13 +1110,42 @@ def cmd_scan(args):
         print(f"{added} added to profile {profile_name!r}")
 
 
+def install_mrpack(pack, dest=None):
+    with zipfile.ZipFile(pack) as z:
+        index = json.loads(z.read("modrinth.index.json"))
+    name = index.get("name") or pack.stem
+    out = Path(dest or name)
+    files = index.get("files") or []
+    print(f"{name} {index.get('versionId', '')} - {len(files)} files")
+    for i, entry in enumerate(files, 1):
+        rel = Path(entry.get("path", ""))
+        if rel.is_absolute() or ".." in rel.parts:
+            sys.exit(f"Unsafe path in mrpack: {entry.get('path')!r}")
+        urls = entry.get("downloads") or []
+        if not urls:
+            print(f"[{i}/{len(files)}] skip {rel} (no download URL)")
+            continue
+        fetch_to(urls[0], out / rel, (entry.get("hashes") or {}).get("sha1"))
+        print(f"[{i}/{len(files)}] {rel}")
+    with zipfile.ZipFile(pack) as z:
+        for member in z.namelist():
+            if member.startswith("overrides/") and not member.endswith("/"):
+                target = out / member[len("overrides/"):]
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with z.open(member) as src, target.open("wb") as dst:
+                    shutil.copyfileobj(src, dst)
+    print(f"\nInstalled to {out.resolve()}")
+
+
 def install_pack(pack, dest=None):
     pack = Path(pack)
     try:
         with zipfile.ZipFile(pack) as z:
+            if "modrinth.index.json" in z.namelist():
+                return install_mrpack(pack, dest)
             manifest = json.loads(z.read("manifest.json"))
     except (zipfile.BadZipFile, KeyError) as exc:
-        sys.exit(f"Not a CurseForge modpack zip: {pack} ({exc})")
+        sys.exit(f"Not a modpack zip: {pack} ({exc})")
     minecraft = manifest.get("minecraft") or {}
     loaders = [l.get("id", "") for l in minecraft.get("modLoaders") or []]
     loader = loaders[0].split("-")[0] if loaders else "?"
@@ -931,9 +1181,18 @@ def cmd_pack(args):
     install_pack(download_file(f, args.out), args.dir)
 
 
+def resolve_modpack(value):
+    if str(value).isdigit():
+        return cf_mod(value)
+    mr = modrinth_project(value)
+    if mr and mr.get("type") == "modpack":
+        return mr
+    return cf_mod(value)
+
+
 def cmd_modpack_add(args):
-    mod = cf_mod(args.mod, MINECRAFT)
-    f = pick_file(mod["id"], args.version, args.loader)
+    mod = resolve_modpack(args.mod)
+    f = pick_any(mod, args.version, args.loader)
     if not f:
         sys.exit("No files match those filters.")
     name = args.name or mod["name"]
@@ -943,8 +1202,9 @@ def cmd_modpack_add(args):
     install_pack(zip_path, out)
     cfg = load_config()
     cfg.setdefault("modpacks", {})[name] = {
-        "id": mod["id"], "name": mod["name"], "dir": str(out.resolve()),
-        "fileId": f["id"], "version": args.version, "loader": args.loader,
+        "source": mod["source"], "id": mod["id"], "name": mod["name"],
+        "dir": str(out.resolve()), "fileId": f["id"],
+        "version": args.version, "loader": args.loader,
     }
     if args.use or not cfg.get("active_modpack"):
         cfg["active_modpack"] = name
@@ -973,7 +1233,7 @@ def cmd_modpack_info(args):
     if name not in packs:
         sys.exit(f"No modpack named {name!r}")
     p = packs[name]
-    print(f"{name} (id {p['id']})")
+    print(f"{name} (id {p['id']}, source {p.get('source', 'curseforge')})")
     print(f"Directory : {p.get('dir')}")
     print(f"File      : {p.get('fileId')}  "
           f"{p.get('version') or 'any version'} / {p.get('loader') or 'any loader'}")
@@ -988,7 +1248,8 @@ def cmd_modpack_upgrade(args):
     if name not in packs:
         sys.exit(f"No modpack named {name!r}")
     p = packs[name]
-    f = pick_file(p["id"], p.get("version"), p.get("loader"))
+    f = pick_any({"source": p.get("source", "curseforge"), "id": p["id"]},
+                 p.get("version"), p.get("loader"))
     if not f:
         sys.exit("No files match those filters.")
     if f["id"] == p.get("fileId"):
@@ -1082,10 +1343,12 @@ def main(argv=None):
     psub = sp.add_subparsers(dest="profile_cmd", required=True)
 
     s = psub.add_parser("create", help="create a profile")
-    s.add_argument("name")
+    s.add_argument("name", nargs="?")
     s.add_argument("--version", help="game version, e.g. 1.21.1")
     s.add_argument("--loader", choices=LOADERS)
     s.add_argument("--channel", choices=["release", "beta", "alpha", "any"])
+    s.add_argument("--filter", action="append", default=[],
+                   help="Type=Value, e.g. Filename=.*fabric.* (repeatable)")
     s.add_argument("--dir", help="mods directory")
     s.add_argument("--game", type=int, default=MINECRAFT)
     s.add_argument("--use", action="store_true", help="make it the active profile")
@@ -1096,6 +1359,9 @@ def main(argv=None):
     s.add_argument("--version")
     s.add_argument("--loader", choices=LOADERS)
     s.add_argument("--channel", choices=["release", "beta", "alpha", "any"])
+    s.add_argument("--filter", action="append", default=[],
+                   help="Type=Value, e.g. Filename=.*fabric.* (repeatable)")
+    s.add_argument("--clear-filters", action="store_true")
     s.add_argument("--dir")
     s.set_defaults(func=cmd_profile_configure)
 

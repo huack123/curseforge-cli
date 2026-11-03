@@ -9,8 +9,9 @@ The entire tool is a single Python file using only the standard library. No `pip
 - Full CurseForge API coverage: games, categories, mods, files, fingerprints, Minecraft versions and mod loaders
 - Multi-source mods: CurseForge, Modrinth and GitHub Releases
 - Profiles with their own game version, mod loader, release channel, output directory and mod list
+- Ferium-style filters: game version (strict or minor), loader (prefer or any), release channel, and filename/title/description regex
 - `add` / `remove` / `upgrade` workflow with recursive dependency resolution and parallel downloads
-- Tracked modpacks with one-command upgrades
+- Tracked modpacks from CurseForge (`manifest.json`) or Modrinth (`.mrpack`) with one-command upgrades
 - `install` with recursive required-dependency resolution and a `--dry-run` preview
 - `update` that identifies installed jars by CurseForge fingerprint and fetches newer compatible files
 - Modpack installation from a local zip (`import`) or directly from CurseForge (`pack`)
@@ -71,6 +72,19 @@ python cf.py upgrade
 python cf.py list --verbose
 ```
 
+Filters can be added on top of the simple flags. Each is `Type=Value` and repeatable:
+
+```bash
+python cf.py profile configure main --filter "Filename=.*fabric.*"
+python cf.py profile configure main --filter "ModLoaderAny=fabric,quilt"
+python cf.py profile configure main --filter "GameVersionMinor=1.21.1"
+python cf.py profile configure main --clear-filters
+```
+
+Supported filter types: `GameVersionStrict`, `GameVersionMinor`, `ModLoaderPrefer`, `ModLoaderAny`, `ReleaseChannel`, `Filename`, `Title`, `Description`. Filters are applied to the candidate list from every source; GitHub candidates fall back to filename/release-text matching because GitHub has no Minecraft metadata.
+
+If `profile create` is run without a name, version, or loader on an interactive terminal, it prompts for the missing values. In a script or CI it fails with guidance instead.
+
 Profiles live in the same config file as the API key. The active profile is used by `add`, `remove`, `list`, `upgrade`, and as the default for `install`, `update` and `download ... latest`. Use `--profile <name>` on those commands or `cf profile use <name>` to switch. `cf profile configure <name> --version ... --loader ... --channel ...` changes settings later.
 
 `add` and `install` detect the source: a numeric ID is CurseForge, `owner/repo` is GitHub, anything else is looked up on Modrinth first and then CurseForge. Force it with `--source`.
@@ -79,12 +93,15 @@ Profiles live in the same config file as the API key. The active profile is used
 
 ```bash
 python cf.py modpack add all-the-mods-10 --dir D:\packs\atm10
+python cf.py modpack add fabulously-optimized --dir D:\packs\fo
 python cf.py modpack list
 python cf.py modpack upgrade
 python cf.py modpack info
 ```
 
-Tracked modpacks record their project ID, installed file ID and target directory. `modpack upgrade` downloads the newer pack file and reinstalls its mods and `overrides/`. `modpack delete` only stops tracking; files are left untouched.
+The source is detected automatically: numeric IDs are CurseForge, otherwise Modrinth is tried first and CurseForge is the fallback. CurseForge packs use `manifest.json`; Modrinth packs use `modrinth.index.json` with SHA1-verified files and `overrides/`.
+
+Tracked modpacks record their source, project ID, installed file ID and target directory. `modpack upgrade` downloads the newer pack file and reinstalls its mods and overrides. `modpack delete` only stops tracking; files are left untouched.
 
 ### Catalog
 
@@ -132,8 +149,8 @@ Tracked modpacks record their project ID, installed file ID and target directory
 
 | Command | Description |
 |---|---|
-| `profile create <name>` | Create a profile (`--version`, `--loader`, `--channel`, `--dir`, `--use`) |
-| `profile configure <name>` | Change version, loader, channel, or directory |
+| `profile create <name>` | Create a profile (`--version`, `--loader`, `--channel`, `--filter`, `--dir`, `--use`) |
+| `profile configure <name>` | Change version, loader, channel, directory, or filters (`--clear-filters`) |
 | `profile list` | List profiles |
 | `profile use <name>` | Set the active profile |
 | `profile show [name]` | Show a profile and its mods |
@@ -200,6 +217,8 @@ python cf.py search sodium --loader fabric --json
 - Downloads are verified against the SHA1 hash supplied by the API; a mismatch deletes the partial file and aborts.
 - `429` and `5xx` responses are retried up to four attempts, honoring `Retry-After` when present.
 - `upgrade` resolves required dependencies recursively and downloads up to 8 files in parallel (`--parallel`).
+- Filters run over a unified candidate list (newest first) and intersect, with `ModLoaderPrefer` applied last, matching ferium's selection order.
+- `.mrpack` paths are validated before extraction so a pack cannot write outside its target directory.
 - Some projects disable third-party downloads; their files return no download URL and the command exits with a clear message.
 
 ## Testing
@@ -208,7 +227,7 @@ python cf.py search sodium --loader fabric --json
 python -m unittest -v test_cf
 ```
 
-The suite covers query construction, bulk request bodies, dependency resolution, multi-source resolution, modpack extraction and tracking, retry behavior, checksum failure handling, GitHub version boundaries and the fingerprint implementation. The Modrinth and GitHub paths are also exercised against the live APIs during development.
+The suite covers query construction, bulk request bodies, dependency resolution, multi-source resolution, filter selection, mrpack extraction, modpack tracking, retry behavior, checksum failure handling, GitHub version boundaries and the fingerprint implementation. The Modrinth and GitHub paths are also exercised against the live APIs during development.
 
 ## Project layout
 

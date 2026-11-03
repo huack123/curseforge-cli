@@ -41,6 +41,13 @@ def ref_fingerprint(data):
 
 
 class TestCf(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        patch = mock.patch.object(cf, "CONFIG", Path(self._tmp.name) / "config.json")
+        patch.start()
+        self.addCleanup(patch.stop)
+
     def run_cli(self, argv, *payloads):
         reqs = []
 
@@ -130,7 +137,9 @@ class TestCf(unittest.TestCase):
                 self.run_cli(
                     ["add", "238222"],
                     {"data": {"id": 238222, "name": "JEI", "slug": "jei"}},
-                    {"data": [{"id": 1, "modId": 238222, "fileName": "jei.jar", "displayName": "JEI"}]},
+                    {"data": [{"id": 1, "modId": 238222, "fileName": "jei.jar", "displayName": "JEI",
+                               "releaseType": 1, "fileDate": "2026-01-01",
+                               "gameVersions": ["1.21.1", "Fabric"]}]},
                 )
                 data = json.loads(config.read_text())
                 self.assertEqual([m["id"] for m in data["profiles"]["test"]["mods"]], [238222])
@@ -151,7 +160,8 @@ class TestCf(unittest.TestCase):
             }))
             payloads = [
                 {"data": [{"id": 10, "modId": 1, "fileName": "a.jar", "displayName": "A",
-                           "dependencies": []}]},
+                           "releaseType": 1, "fileDate": "2026-01-01",
+                           "gameVersions": ["1.21.1", "Fabric"], "dependencies": []}]},
                 {"data": "https://example.test/a.jar"},
             ]
 
@@ -207,6 +217,49 @@ class TestCf(unittest.TestCase):
         with mock.patch.object(cf, "github", return_value=releases):
             self.assertIsNone(cf.github_pick("owner/repo", "1.21.1", "fabric"))
             self.assertIsNotNone(cf.github_pick("owner/repo", "1.21.11", "fabric"))
+
+    def test_select_candidates_filters(self):
+        cands = [
+            {"source": "curseforge", "fileName": "a.jar", "displayName": "A", "description": "",
+             "channel": "beta", "game_versions": ["1.21.1"], "loaders": ["fabric"], "date": "2"},
+            {"source": "curseforge", "fileName": "b-fabric.jar", "displayName": "B", "description": "",
+             "channel": "release", "game_versions": ["1.21.1"], "loaders": ["fabric"], "date": "1"},
+        ]
+        got = cf.select_candidates(cands, [{"type": "Filename", "value": ".*fabric.*"}])
+        self.assertEqual(got["fileName"], "b-fabric.jar")
+        got = cf.select_candidates(cands, [{"type": "ReleaseChannel", "value": "release"}])
+        self.assertEqual(got["fileName"], "b-fabric.jar")
+        self.assertIsNone(cf.select_candidates(cands, [{"type": "GameVersionStrict", "value": ["1.21.2"]}]))
+
+    def test_profile_filter_cli(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.json"
+            with mock.patch.object(cf, "CONFIG", config):
+                self.run_cli(["profile", "create", "p", "--version", "1.21.1", "--loader", "fabric",
+                              "--dir", tmp, "--filter", "Filename=.*fabric.*"])
+            data = json.loads(config.read_text())
+            self.assertEqual(data["profiles"]["p"]["filters"][0]["type"], "Filename")
+
+    def test_install_mrpack(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pack = Path(tmp) / "pack.mrpack"
+            index = {"name": "MRPack", "versionId": "1.0",
+                     "files": [{"path": "mods/sodium.jar",
+                                "hashes": {"sha1": hashlib.sha1(b"jar").hexdigest()},
+                                "downloads": ["https://example.test/sodium.jar"]}],
+                     "dependencies": {"minecraft": "1.21.1"}}
+            with zipfile.ZipFile(pack, "w") as z:
+                z.writestr("modrinth.index.json", json.dumps(index))
+                z.writestr("overrides/config/x.txt", "hi")
+
+            def fake_download(url, dest):
+                Path(dest).write_bytes(b"jar")
+
+            out = Path(tmp) / "out"
+            with mock.patch("urllib.request.urlretrieve", side_effect=fake_download):
+                self.run_cli(["import", str(pack), "--dir", str(out)])
+            self.assertEqual((out / "mods" / "sodium.jar").read_bytes(), b"jar")
+            self.assertEqual((out / "config" / "x.txt").read_text(), "hi")
 
     def test_modpack_add_registers_pack(self):
         with tempfile.TemporaryDirectory() as tmp:
