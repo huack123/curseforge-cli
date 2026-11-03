@@ -13,6 +13,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -24,15 +25,52 @@ SORTS = {"featured": 1, "popularity": 2, "lastupdated": 3, "name": 4, "author": 
 RELEASE = {1: "release", 2: "beta", 3: "alpha"}
 VERSION_TYPES = {1: "release", 2: "snapshot", 3: "old_beta", 4: "old_alpha"}
 MC_VERSION = re.compile(r"^\d+\.\d+")
+PARALLEL = 8
+
+
+def load_config():
+    if CONFIG.exists():
+        try:
+            return json.loads(CONFIG.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+    return {}
+
+
+def save_config(cfg):
+    CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
 
 
 def api_key():
     key = os.environ.get("CURSEFORGE_API_KEY", "").strip()
-    if not key and CONFIG.exists():
-        key = json.loads(CONFIG.read_text(encoding="utf-8")).get("api_key", "")
+    if not key:
+        key = load_config().get("api_key", "")
     if not key:
         sys.exit("No API key. Get one at https://console.curseforge.com/ then run: cf auth <key>")
     return key
+
+
+def profile_defaults():
+    cfg = load_config()
+    return (cfg.get("profiles") or {}).get(cfg.get("active_profile") or "") or {}
+
+
+def get_profile(name):
+    cfg = load_config()
+    profiles = cfg.get("profiles") or {}
+    if name not in profiles:
+        sys.exit(f"No profile named {name!r}. See: cf profile list")
+    return name, cfg, profiles[name]
+
+
+def active_profile(args, required=True):
+    name = getattr(args, "profile", None) or load_config().get("active_profile")
+    if not name:
+        if required:
+            sys.exit("No active profile. Create one: cf profile create <name> --version 1.21.1 --loader fabric")
+        return None, load_config(), {}
+    return get_profile(name)
 
 
 RETRY_CODES = (429, 500, 502, 503, 504)
@@ -149,6 +187,37 @@ def default_mods_dir():
     return Path(os.environ.get("APPDATA") or Path.home()) / ".minecraft" / "mods"
 
 
+def download_many(files, out, workers=PARALLEL):
+    done, failed = [], []
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        futures = {pool.submit(download_file, f, out): f for f in files}
+        for future in as_completed(futures):
+            f = futures[future]
+            try:
+                done.append(future.result())
+                print(f"install  {f['fileName']}")
+            except (Exception, SystemExit) as exc:
+                failed.append(f["fileName"])
+                print(f"FAILED   {f['fileName']}: {exc}")
+    return done, failed
+
+
+def clean_dir(folder, keep):
+    old = folder / ".old"
+    moved = 0
+    for jar in sorted(folder.glob("*.jar")):
+        if jar.name in keep:
+            continue
+        old.mkdir(exist_ok=True)
+        target = old / jar.name
+        if target.exists():
+            target = old / f"{jar.stem}.{int(time.time())}{jar.suffix}"
+        shutil.move(str(jar), str(target))
+        print(f"archive  {jar.name} -> .old/")
+        moved += 1
+    return moved
+
+
 def cf_fingerprint(data):
     """CurseForge fingerprint: murmur2 (seed 1) over bytes, skipping tab/LF/CR/space."""
     m = 0x5BD1E995
@@ -185,11 +254,172 @@ def file_context(f):
 
 
 def cmd_auth(args):
-    CONFIG.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG.write_text(json.dumps({"api_key": args.key}), encoding="utf-8")
+    cfg = load_config()
+    cfg["api_key"] = args.key
+    save_config(cfg)
     if os.name != "nt":
         CONFIG.chmod(0o600)
     print(f"Saved API key to {CONFIG}")
+
+
+def cmd_profile_create(args):
+    cfg = load_config()
+    profiles = cfg.setdefault("profiles", {})
+    if args.name in profiles:
+        sys.exit(f"Profile {args.name!r} already exists")
+    profiles[args.name] = {
+        "game": args.game,
+        "version": args.version,
+        "loader": args.loader,
+        "dir": str(Path(args.dir or default_mods_dir()).resolve()),
+        "mods": [],
+    }
+    if args.use or not cfg.get("active_profile"):
+        cfg["active_profile"] = args.name
+    save_config(cfg)
+    print(f"Created profile {args.name!r} ({args.version or 'any version'} / {args.loader or 'any loader'})")
+    if cfg.get("active_profile") == args.name:
+        print(f"Active profile: {args.name}")
+
+
+def cmd_profile_list(args):
+    cfg = load_config()
+    profiles = cfg.get("profiles") or {}
+    if not profiles:
+        print("No profiles. Create one: cf profile create <name> --version 1.21.1 --loader fabric")
+        return
+    table(["", "Name", "Version", "Loader", "Mods", "Directory"], [
+        ["*" if name == cfg.get("active_profile") else "", name, p.get("version") or "-",
+         p.get("loader") or "-", len(p.get("mods") or []), p.get("dir", "")]
+        for name, p in profiles.items()
+    ])
+
+
+def cmd_profile_use(args):
+    cfg = load_config()
+    if args.name not in (cfg.get("profiles") or {}):
+        sys.exit(f"No profile named {args.name!r}")
+    cfg["active_profile"] = args.name
+    save_config(cfg)
+    print(f"Active profile: {args.name}")
+
+
+def cmd_profile_show(args):
+    name = args.name or load_config().get("active_profile")
+    if not name:
+        sys.exit("No active profile. See: cf profile list")
+    name, _, prof = get_profile(name)
+    print(f"{name} ({prof.get('version') or 'any version'} / {prof.get('loader') or 'any loader'})")
+    print(f"Directory: {prof.get('dir')}")
+    mods = prof.get("mods") or []
+    table(["ID", "Name", "Slug"], [[m["id"], m.get("name", ""), m.get("slug", "")] for m in mods])
+    print(f"\n{len(mods)} mods")
+
+
+def cmd_profile_delete(args):
+    cfg = load_config()
+    profiles = cfg.get("profiles") or {}
+    if args.name not in profiles:
+        sys.exit(f"No profile named {args.name!r}")
+    del profiles[args.name]
+    if cfg.get("active_profile") == args.name:
+        cfg["active_profile"] = next(iter(profiles), None)
+    save_config(cfg)
+    print(f"Deleted profile {args.name!r}")
+
+
+def cmd_add(args):
+    name, cfg, prof = active_profile(args)
+    version, loader = prof.get("version"), prof.get("loader")
+    mods = prof.setdefault("mods", [])
+    added = 0
+    for value in args.mods:
+        mod_id = resolve_mod(value, prof.get("game", MINECRAFT))
+        if any(m["id"] == mod_id for m in mods):
+            print(f"have     {mod_id}")
+            continue
+        m = api(f"/mods/{mod_id}")["data"]
+        if not args.force and not pick_file(mod_id, version, loader):
+            print(f"skip     {m['name']}: no file for {version or 'any version'}/{loader or 'any loader'} (use --force)")
+            continue
+        mods.append({"id": mod_id, "name": m["name"], "slug": m.get("slug", "")})
+        added += 1
+        print(f"added    {m['name']}")
+    save_config(cfg)
+    print(f"\nRun 'cf upgrade' to download {added} new mod(s) into profile {name!r}.")
+
+
+def cmd_remove(args):
+    name, cfg, prof = active_profile(args)
+    mods = prof.get("mods") or []
+    removed = 0
+    for value in args.mods:
+        if value.isdigit():
+            match = next((m for m in mods if m["id"] == int(value)), None)
+        else:
+            needle = value.lower()
+            match = next((m for m in mods
+                          if needle in (m.get("name", "").lower(), m.get("slug", "").lower())), None)
+        if not match:
+            print(f"not found: {value}")
+            continue
+        mods.remove(match)
+        removed += 1
+        print(f"removed  {match['name']}")
+    prof["mods"] = mods
+    save_config(cfg)
+    print(f"\n{removed} removed from profile {name!r}")
+
+
+def cmd_list(args):
+    name, _, prof = active_profile(args)
+    mods = prof.get("mods") or []
+    table(["ID", "Name", "Slug"], [[m["id"], m.get("name", ""), m.get("slug", "")] for m in mods])
+    print(f"\n{len(mods)} mods in profile {name!r} "
+          f"({prof.get('version') or 'any version'} / {prof.get('loader') or 'any loader'})")
+
+
+def cmd_upgrade(args):
+    name, _, prof = active_profile(args)
+    version, loader = prof.get("version"), prof.get("loader")
+    out = Path(args.dir or prof.get("dir") or default_mods_dir())
+    mods = prof.get("mods") or []
+    if not mods:
+        sys.exit(f"Profile {name!r} has no mods. Add some: cf add <mod>")
+
+    queue = [m["id"] for m in mods]
+    seen, plan, filenames = set(), [], set()
+    while queue:
+        mod_id = queue.pop(0)
+        if mod_id in seen:
+            continue
+        seen.add(mod_id)
+        f = pick_file(mod_id, version, loader)
+        if not f:
+            print(f"skip     {mod_id}: no file for {version or 'any version'}/{loader or 'any loader'}")
+            continue
+        if f["fileName"] in filenames:
+            continue
+        filenames.add(f["fileName"])
+        plan.append(f)
+        for dep in f.get("dependencies") or []:
+            if dep.get("relationType") == 3 and dep["modId"] not in seen:
+                queue.append(dep["modId"])
+
+    out.mkdir(parents=True, exist_ok=True)
+    missing = [f for f in plan if not (out / Path(f["fileName"]).name).exists()]
+    print(f"{len(plan)} files resolved, {len(plan) - len(missing)} already present in {out}")
+    for f in missing:
+        print(f"  {f['fileName']}")
+    if args.dry_run:
+        print("\n(dry run, nothing downloaded)")
+        return
+    if missing:
+        done, failed = download_many(missing, out, args.parallel)
+        print(f"\n{len(done)} downloaded, {len(failed)} failed")
+    if args.clean:
+        moved = clean_dir(out, {Path(f["fileName"]).name for f in plan})
+        print(f"{moved} stale jar(s) moved to {out / '.old'}")
 
 
 def cmd_games(args):
@@ -345,7 +575,8 @@ def cmd_url(args):
 
 def cmd_download(args):
     if args.file == "latest":
-        f = pick_file(args.mod, args.version, args.loader)
+        prof = profile_defaults()
+        f = pick_file(args.mod, args.version or prof.get("version"), args.loader or prof.get("loader"))
         if not f:
             sys.exit("No files match those filters.")
     else:
@@ -355,7 +586,10 @@ def cmd_download(args):
 
 
 def cmd_install(args):
-    out = Path(args.dir or default_mods_dir())
+    prof = profile_defaults()
+    version = args.version or prof.get("version")
+    loader = args.loader or prof.get("loader")
+    out = Path(args.dir or prof.get("dir") or default_mods_dir())
     queue = [resolve_mod(args.mod, args.game)]
     seen = set()
     while queue:
@@ -363,9 +597,9 @@ def cmd_install(args):
         if mod_id in seen:
             continue
         seen.add(mod_id)
-        f = pick_file(mod_id, args.version, args.loader)
+        f = pick_file(mod_id, version, loader)
         if not f:
-            print(f"skip     mod {mod_id}: no file for {args.version or 'any version'}/{args.loader or 'any loader'}")
+            print(f"skip     mod {mod_id}: no file for {version or 'any version'}/{loader or 'any loader'}")
             continue
         dest = out / Path(f["fileName"]).name
         if args.dry_run:
@@ -385,7 +619,7 @@ def cmd_install(args):
 
 
 def cmd_update(args):
-    folder = Path(args.dir or default_mods_dir())
+    folder = Path(args.dir or profile_defaults().get("dir") or default_mods_dir())
     jars = sorted(folder.glob("*.jar"))
     if not jars:
         sys.exit(f"No .jar files in {folder}")
@@ -528,6 +762,33 @@ def main(argv=None):
     sp = add("auth", cmd_auth, "save your CurseForge API key")
     sp.add_argument("key")
 
+    sp = add("profile", cmd_profile_list, "manage profiles")
+    psub = sp.add_subparsers(dest="profile_cmd", required=True)
+
+    s = psub.add_parser("create", help="create a profile")
+    s.add_argument("name")
+    s.add_argument("--version", help="game version, e.g. 1.21.1")
+    s.add_argument("--loader", choices=LOADERS)
+    s.add_argument("--dir", help="mods directory")
+    s.add_argument("--game", type=int, default=MINECRAFT)
+    s.add_argument("--use", action="store_true", help="make it the active profile")
+    s.set_defaults(func=cmd_profile_create)
+
+    s = psub.add_parser("list", help="list profiles")
+    s.set_defaults(func=cmd_profile_list)
+
+    s = psub.add_parser("use", help="set the active profile")
+    s.add_argument("name")
+    s.set_defaults(func=cmd_profile_use)
+
+    s = psub.add_parser("show", help="show a profile")
+    s.add_argument("name", nargs="?")
+    s.set_defaults(func=cmd_profile_show)
+
+    s = psub.add_parser("delete", help="delete a profile")
+    s.add_argument("name")
+    s.set_defaults(func=cmd_profile_delete)
+
     add("games", cmd_games, "list games")
 
     sp = add("game", cmd_game, "game details")
@@ -624,6 +885,25 @@ def main(argv=None):
     sp.add_argument("--loader", choices=LOADERS)
     sp.add_argument("--dir", help="mods directory (default: %%APPDATA%%\\.minecraft\\mods)")
     sp.add_argument("--dry-run", action="store_true", help="only report available updates")
+
+    sp = add("add", cmd_add, "add mods to the active profile")
+    sp.add_argument("mods", nargs="+", help="mod ids or slugs")
+    sp.add_argument("--profile")
+    sp.add_argument("--force", action="store_true", help="skip the compatibility check")
+
+    sp = add("remove", cmd_remove, "remove mods from the active profile")
+    sp.add_argument("mods", nargs="+", help="mod ids, names, or slugs")
+    sp.add_argument("--profile")
+
+    sp = add("list", cmd_list, "list mods in the active profile")
+    sp.add_argument("--profile")
+
+    sp = add("upgrade", cmd_upgrade, "download latest compatible versions for the profile")
+    sp.add_argument("--profile")
+    sp.add_argument("--dir", help="override the profile's mods directory")
+    sp.add_argument("--parallel", type=int, default=PARALLEL, help="simultaneous downloads")
+    sp.add_argument("--clean", action="store_true", help="move stale jars to .old/")
+    sp.add_argument("--dry-run", action="store_true", help="show what would be downloaded")
 
     sp = add("scan", cmd_scan, "identify local jars by fingerprint")
     sp.add_argument("path", help="a .jar file or a folder of jars")

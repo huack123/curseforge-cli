@@ -107,6 +107,62 @@ class TestCf(unittest.TestCase):
             self.assertEqual(download.call_count, 2)
             self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), ["a.jar", "b.jar"])
 
+    def test_auth_preserves_profiles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.json"
+            config.write_text(json.dumps({"profiles": {"x": {}}, "active_profile": "x"}))
+            with mock.patch.object(cf, "CONFIG", config):
+                self.run_cli(["auth", "newkey"])
+            data = json.loads(config.read_text())
+            self.assertEqual(data["api_key"], "newkey")
+            self.assertIn("x", data["profiles"])
+
+    def test_profile_create_add_list_remove(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.json"
+            with mock.patch.object(cf, "CONFIG", config):
+                self.run_cli(["profile", "create", "test", "--version", "1.21.1",
+                              "--loader", "fabric", "--dir", tmp])
+                data = json.loads(config.read_text())
+                self.assertEqual(data["active_profile"], "test")
+                self.assertEqual(data["profiles"]["test"]["loader"], "fabric")
+
+                self.run_cli(
+                    ["add", "238222"],
+                    {"data": {"id": 238222, "name": "JEI", "slug": "jei"}},
+                    {"data": [{"id": 1, "modId": 238222, "fileName": "jei.jar", "displayName": "JEI"}]},
+                )
+                data = json.loads(config.read_text())
+                self.assertEqual([m["id"] for m in data["profiles"]["test"]["mods"]], [238222])
+
+                self.run_cli(["list"])
+
+                self.run_cli(["remove", "238222"])
+                data = json.loads(config.read_text())
+                self.assertEqual(data["profiles"]["test"]["mods"], [])
+
+    def test_upgrade_downloads_missing_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.json"
+            config.write_text(json.dumps({
+                "active_profile": "test",
+                "profiles": {"test": {"game": 432, "version": "1.21.1", "loader": "fabric",
+                                      "dir": tmp, "mods": [{"id": 1, "name": "A", "slug": "a"}]}},
+            }))
+            payloads = [
+                {"data": [{"id": 10, "modId": 1, "fileName": "a.jar", "displayName": "A",
+                           "dependencies": []}]},
+                {"data": "https://example.test/a.jar"},
+            ]
+
+            def fake_download(req, dest):
+                Path(dest).write_bytes(b"jar")
+
+            with mock.patch.object(cf, "CONFIG", config), \
+                    mock.patch("urllib.request.urlretrieve", side_effect=fake_download):
+                self.run_cli(["upgrade"], *payloads)
+            self.assertTrue((Path(tmp) / "a.jar").exists())
+
     def test_retry_on_429(self):
         calls = []
 

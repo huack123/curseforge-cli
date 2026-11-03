@@ -7,6 +7,8 @@ The entire tool is a single Python file using only the standard library. No `pip
 ## Features
 
 - Full CurseForge API coverage: games, categories, mods, files, fingerprints, Minecraft versions and mod loaders
+- Profiles with their own game version, mod loader, output directory and mod list
+- `add` / `remove` / `upgrade` workflow with recursive dependency resolution and parallel downloads
 - `install` with recursive required-dependency resolution and a `--dry-run` preview
 - `update` that identifies installed jars by CurseForge fingerprint and fetches newer compatible files
 - Modpack installation from a local zip (`import`) or directly from CurseForge (`pack`)
@@ -52,6 +54,20 @@ The `CURSEFORGE_API_KEY` environment variable takes precedence over the saved ke
 python cf.py <command> [options]
 ```
 
+### Profiles
+
+A profile stores the game version, mod loader, output directory and mod list, so the flags do not need repeating.
+
+```bash
+python cf.py profile create main --version 1.21.1 --loader fabric
+python cf.py add jei sodium
+python cf.py upgrade --dry-run
+python cf.py upgrade
+python cf.py list
+```
+
+Profiles live in the same config file as the API key. The active profile is used by `add`, `remove`, `list`, `upgrade`, and as the default for `install`, `update` and `download ... latest`. Use `--profile <name>` on those commands or `cf profile use <name>` to switch.
+
 ### Catalog
 
 | Command | Description |
@@ -94,7 +110,21 @@ python cf.py <command> [options]
 | `scan <jar\|dir>` | Identify local jars by fingerprint |
 | `worlds` | List local Minecraft worlds |
 
-`install` and `update` target `%APPDATA%\.minecraft\mods` by default; override with `--dir`. `install --dry-run` prints the full plan without writing files. `update --dry-run` reports available updates only and never deletes old jars.
+### Profiles and maintenance
+
+| Command | Description |
+|---|---|
+| `profile create <name>` | Create a profile (`--version`, `--loader`, `--dir`, `--use`) |
+| `profile list` | List profiles |
+| `profile use <name>` | Set the active profile |
+| `profile show [name]` | Show a profile and its mods |
+| `profile delete <name>` | Delete a profile (config only) |
+| `add <mod>...` | Add mods to the active profile (`--force` skips compatibility checks) |
+| `remove <mod>...` | Remove mods by id, name, or slug |
+| `list` | List mods in the active profile |
+| `upgrade` | Download the latest compatible files for the profile |
+
+`install` and `update` target the active profile's directory, or `%APPDATA%\.minecraft\mods` when no profile exists; override with `--dir`. `install --dry-run` prints the full plan without writing files. `upgrade --dry-run` reports the plan, `--parallel N` sets simultaneous downloads, and `--clean` moves stale jars to `.old/` instead of deleting them. `update --dry-run` reports available updates only and never deletes old jars.
 
 ### Reference
 
@@ -119,6 +149,13 @@ python cf.py files 238222 --version 1.21.1 --loader fabric --release release
 python cf.py install jei --version 1.21.1 --loader fabric --dry-run
 python cf.py install jei --version 1.21.1 --loader fabric
 
+# Profile workflow: configure once, then add and upgrade
+python cf.py profile create main --version 1.21.1 --loader fabric
+python cf.py add jei sodium
+python cf.py upgrade --dry-run
+python cf.py upgrade
+python cf.py list
+
 # Identify every jar in a mods folder
 python cf.py scan "C:\Users\<you>\AppData\Roaming\.minecraft\mods"
 
@@ -139,6 +176,7 @@ python cf.py search sodium --loader fabric --json
 - Fingerprints use CurseForge's modified Murmur2 hash (seed `1`, with tab, LF, CR and space bytes stripped), matching the official implementation.
 - Downloads are verified against the SHA1 hash supplied by the API; a mismatch deletes the partial file and aborts.
 - `429` and `5xx` responses are retried up to four attempts, honoring `Retry-After` when present.
+- `upgrade` resolves required dependencies recursively and downloads up to 8 files in parallel (`--parallel`).
 - Some projects disable third-party downloads; their files return no download URL and the command exits with a clear message.
 
 ## Testing
