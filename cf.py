@@ -18,6 +18,9 @@ from datetime import datetime
 from pathlib import Path
 
 API = "https://api.curseforge.com/v1"
+MODRINTH = "https://api.modrinth.com/v2"
+GITHUB = "https://api.github.com"
+UA = "cf-cli/1.2 (https://github.com/huack123/curseforge-cli)"
 CONFIG = Path(os.environ.get("APPDATA") or Path.home()) / "cf-cli" / "config.json"
 MINECRAFT = 432
 LOADERS = {"forge": 1, "cauldron": 2, "liteloader": 3, "fabric": 4, "quilt": 5, "neoforge": 6}
@@ -86,22 +89,20 @@ def retry_delay(exc, attempt):
     return min(2 ** attempt + random.uniform(0, 0.5), 30)
 
 
-def api(path, params=None, body=None):
-    url = API + path
-    query = {k: v for k, v in (params or {}).items() if v is not None}
-    if query:
-        url += "?" + urllib.parse.urlencode(query)
-    headers = {"x-api-key": api_key(), "Accept": "application/json", "User-Agent": "cf-cli/1.1"}
+def request_json(url, headers, body=None, soft=False):
     data = None
     if body is not None:
         data = json.dumps(body).encode()
-        headers["Content-Type"] = "application/json"
+        headers = {**headers, "Content-Type": "application/json"}
     for attempt in range(4):
         req = urllib.request.Request(url, data=data, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 return json.load(resp)
         except urllib.error.HTTPError as exc:
+            if exc.code == 404 and soft:
+                exc.close()
+                return None
             if exc.code in RETRY_CODES and attempt < 3:
                 exc.close()
                 time.sleep(retry_delay(exc, attempt))
@@ -110,6 +111,28 @@ def api(path, params=None, body=None):
             sys.exit(f"HTTP {exc.code} for {url}\n{detail}")
         except urllib.error.URLError as exc:
             sys.exit(f"Network error: {exc.reason}")
+
+
+def with_query(url, params):
+    query = {k: v for k, v in (params or {}).items() if v is not None}
+    return url + ("?" + urllib.parse.urlencode(query) if query else "")
+
+
+def api(path, params=None, body=None, soft=False):
+    headers = {"x-api-key": api_key(), "Accept": "application/json", "User-Agent": UA}
+    return request_json(with_query(API + path, params), headers, body, soft)
+
+
+def modrinth(path, params=None, soft=False):
+    headers = {"Accept": "application/json", "User-Agent": UA}
+    return request_json(with_query(MODRINTH + path, params), headers, None, soft)
+
+
+def github(path, params=None, soft=False):
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": UA}
+    if os.environ.get("GITHUB_TOKEN"):
+        headers["Authorization"] = f"Bearer {os.environ['GITHUB_TOKEN']}"
+    return request_json(with_query(GITHUB + path, params), headers, None, soft)
 
 
 def table(headers, rows):
@@ -147,17 +170,159 @@ def resolve_mod(value, game=MINECRAFT):
     return res["data"][0]["id"]
 
 
-def pick_file(mod_id, version=None, loader=None):
+CHANNELS = {"release": {1}, "beta": {1, 2}, "alpha": {1, 2, 3}}
+MR_CHANNELS = {"release": {"release"}, "beta": {"release", "beta"}, "alpha": {"release", "beta", "alpha"}}
+
+
+def pick_file(mod_id, version=None, loader=None, channel=None):
     # shortcut: newest of the first 50 files; paginate if a mod needs more
     files = api(f"/mods/{mod_id}/files", {
         "gameVersion": version,
         "modLoaderType": loader_id(loader),
         "pageSize": 50,
     })["data"]
+    if channel:
+        files = [f for f in files if f.get("releaseType") in CHANNELS[channel]]
     if not files:
         return None
     files.sort(key=lambda f: (f.get("releaseType") == 1, f.get("fileDate", "")), reverse=True)
-    return files[0]
+    f = dict(files[0])
+    f["source"] = "curseforge"
+    f["dependencies"] = [{"source": "curseforge", "id": d["modId"], "required": True}
+                         for d in f.get("dependencies") or [] if d.get("relationType") == 3]
+    return f
+
+
+def cf_mod(value, game=MINECRAFT):
+    if str(value).isdigit():
+        m = api(f"/mods/{value}")["data"]
+    else:
+        res = api("/mods/search", {"gameId": game, "slug": str(value), "pageSize": 1})
+        if not res["data"]:
+            sys.exit(f"No CurseForge mod with slug {value!r}")
+        m = res["data"][0]
+    return {"source": "curseforge", "id": m["id"],
+            "name": m.get("name") or str(value), "slug": m.get("slug", "")}
+
+
+def modrinth_project(value):
+    m = modrinth(f"/project/{urllib.parse.quote(str(value))}", soft=True)
+    if not m:
+        return None
+    return {"source": "modrinth", "id": m["id"], "name": m.get("title", ""),
+            "slug": m.get("slug", ""), "type": m.get("project_type")}
+
+
+def github_repo(value):
+    if str(value).count("/") != 1:
+        sys.exit("GitHub identifiers must be owner/repo")
+    r = github(f"/repos/{value}", soft=True)
+    if not r:
+        return None
+    return {"source": "github", "id": r["full_name"], "name": r.get("name", str(value)), "slug": ""}
+
+
+def resolve_any(value, source=None, game=MINECRAFT):
+    source = (source or "auto").lower()
+    if source == "auto":
+        if str(value).isdigit():
+            source = "curseforge"
+        elif "/" in str(value):
+            source = "github"
+        else:
+            m = modrinth_project(value)
+            if m:
+                return m
+            source = "curseforge"
+    if source == "curseforge":
+        return cf_mod(value, game)
+    if source == "modrinth":
+        m = modrinth_project(value)
+        if not m:
+            sys.exit(f"No Modrinth project {value!r}")
+        return m
+    m = github_repo(value)
+    if not m:
+        sys.exit(f"No GitHub repository {value!r}")
+    return m
+
+
+def modrinth_pick(project_id, version=None, loader=None, channel=None):
+    params = {}
+    if version:
+        params["game_versions"] = json.dumps([version])
+    if loader:
+        params["loaders"] = json.dumps([loader])
+    versions = modrinth(f"/project/{urllib.parse.quote(str(project_id))}/version", params, soft=True) or []
+    allowed = MR_CHANNELS.get(channel)
+    if allowed:
+        versions = [v for v in versions if v.get("version_type") in allowed]
+    if not versions:
+        return None
+    versions.sort(key=lambda v: v.get("date_published", ""), reverse=True)
+    v = versions[0]
+    files = v.get("files") or []
+    if not files:
+        return None
+    f = next((x for x in files if x.get("primary")), files[0])
+    return {
+        "source": "modrinth",
+        "modId": project_id,
+        "id": v["id"],
+        "fileName": f["filename"],
+        "displayName": v.get("name") or f["filename"],
+        "fileLength": f.get("size"),
+        "url": f["url"],
+        "hashes": [{"algo": 1, "value": (f.get("hashes") or {}).get("sha1", "")}],
+        "dependencies": [{"source": "modrinth", "id": d["project_id"], "required": True}
+                         for d in v.get("dependencies") or []
+                         if d.get("dependency_type") == "required" and d.get("project_id")],
+    }
+
+
+def github_pick(repo, version=None, loader=None, channel=None):
+    releases = github(f"/repos/{repo}/releases", {"per_page": 30}, soft=True) or []
+    if channel in (None, "release"):
+        stable = [r for r in releases if not r.get("prerelease")]
+        releases = stable or releases
+    releases.sort(key=lambda r: r.get("published_at") or "", reverse=True)
+    for release in releases:
+        text = " ".join(str(release.get(k) or "") for k in ("name", "tag_name", "body")).lower()
+        for asset in release.get("assets") or []:
+            name = asset.get("name", "")
+            if not name.lower().endswith(".jar"):
+                continue
+            haystack = f"{text} {name.lower()}"
+            if version and not re.search(rf"(?<![\d.]){re.escape(version)}(?![\d.])", haystack):
+                continue
+            if loader and loader not in haystack:
+                continue
+            return {
+                "source": "github",
+                "modId": repo,
+                "id": release["id"],
+                "fileName": name,
+                "displayName": release.get("name") or name,
+                "fileLength": asset.get("size"),
+                "url": asset["browser_download_url"],
+                "hashes": [],
+                "dependencies": [],
+            }
+    return None
+
+
+def pick_any(mod, version=None, loader=None, channel=None):
+    source = mod.get("source", "curseforge")
+    if source == "modrinth":
+        return modrinth_pick(mod["id"], version, loader, channel)
+    if source == "github":
+        return github_pick(mod["id"], version, loader, channel)
+    return pick_file(mod["id"], version, loader, channel)
+
+
+def normalize_mod(mod):
+    return {"source": mod.get("source", "curseforge"), "id": mod["id"],
+            "name": mod.get("name", ""), "slug": mod.get("slug", "")}
 
 
 def sha1_of(path):
@@ -171,11 +336,16 @@ def sha1_of(path):
 def download_file(file_info, out):
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
-    url = api(f"/mods/{file_info['modId']}/files/{file_info['id']}/download-url")["data"]
+    url = file_info.get("url") or file_info.get("downloadUrl")
+    if not url and file_info.get("modId") and file_info.get("id"):
+        url = api(f"/mods/{file_info['modId']}/files/{file_info['id']}/download-url")["data"]
     if not url:
         sys.exit(f"No download URL for {file_info.get('displayName')} (author disabled third-party downloads).")
     dest = out / Path(file_info["fileName"]).name
-    urllib.request.urlretrieve(urllib.request.Request(url, headers={"User-Agent": "cf-cli/1.1"}), dest)
+    try:
+        urllib.request.urlretrieve(url, dest)
+    except (urllib.error.URLError, urllib.error.ContentTooShortError, OSError) as exc:
+        sys.exit(f"Download failed for {dest.name}: {exc}")
     expected = next((h["value"].lower() for h in file_info.get("hashes") or [] if h.get("algo") == 1), None)
     if expected and sha1_of(dest) != expected:
         dest.unlink()
@@ -271,6 +441,7 @@ def cmd_profile_create(args):
         "game": args.game,
         "version": args.version,
         "loader": args.loader,
+        "channel": None if args.channel == "any" else args.channel,
         "dir": str(Path(args.dir or default_mods_dir()).resolve()),
         "mods": [],
     }
@@ -293,6 +464,20 @@ def cmd_profile_list(args):
          p.get("loader") or "-", len(p.get("mods") or []), p.get("dir", "")]
         for name, p in profiles.items()
     ])
+
+
+def cmd_profile_configure(args):
+    name, cfg, prof = get_profile(args.name)
+    if args.version is not None:
+        prof["version"] = args.version
+    if args.loader is not None:
+        prof["loader"] = args.loader
+    if args.dir is not None:
+        prof["dir"] = str(Path(args.dir).resolve())
+    if args.channel is not None:
+        prof["channel"] = None if args.channel == "any" else args.channel
+    save_config(cfg)
+    print(f"Configured profile {name!r}")
 
 
 def cmd_profile_use(args):
@@ -330,21 +515,22 @@ def cmd_profile_delete(args):
 
 def cmd_add(args):
     name, cfg, prof = active_profile(args)
-    version, loader = prof.get("version"), prof.get("loader")
+    version, loader, channel = prof.get("version"), prof.get("loader"), prof.get("channel")
     mods = prof.setdefault("mods", [])
     added = 0
     for value in args.mods:
-        mod_id = resolve_mod(value, prof.get("game", MINECRAFT))
-        if any(m["id"] == mod_id for m in mods):
-            print(f"have     {mod_id}")
+        mod = resolve_any(value, args.source, prof.get("game", MINECRAFT))
+        key = (mod["source"], str(mod["id"]))
+        if any((m.get("source", "curseforge"), str(m["id"])) == key for m in mods):
+            print(f"have     {mod['name']}")
             continue
-        m = api(f"/mods/{mod_id}")["data"]
-        if not args.force and not pick_file(mod_id, version, loader):
-            print(f"skip     {m['name']}: no file for {version or 'any version'}/{loader or 'any loader'} (use --force)")
+        if not args.force and not pick_any(mod, version, loader, channel):
+            print(f"skip     {mod['name']}: no file for {version or 'any version'}/"
+                  f"{loader or 'any loader'} (use --force)")
             continue
-        mods.append({"id": mod_id, "name": m["name"], "slug": m.get("slug", "")})
+        mods.append(normalize_mod(mod))
         added += 1
-        print(f"added    {m['name']}")
+        print(f"added    {mod['name']} [{mod['source']}]")
     save_config(cfg)
     print(f"\nRun 'cf upgrade' to download {added} new mod(s) into profile {name!r}.")
 
@@ -373,8 +559,23 @@ def cmd_remove(args):
 
 def cmd_list(args):
     name, _, prof = active_profile(args)
-    mods = prof.get("mods") or []
-    table(["ID", "Name", "Slug"], [[m["id"], m.get("name", ""), m.get("slug", "")] for m in mods])
+    mods = [normalize_mod(m) for m in prof.get("mods") or []]
+    if args.markdown:
+        print("| Name | ID | Source |")
+        print("|---|---|---|")
+        for m in sorted(mods, key=lambda x: x.get("name", "").lower()):
+            print(f"| {m.get('name', '')} | {m['id']} | {m['source']} |")
+        return
+    if args.verbose:
+        rows = []
+        for m in mods:
+            latest = pick_any(m, prof.get("version"), prof.get("loader"), prof.get("channel"))
+            rows.append([m["source"], m["id"], m.get("name", ""),
+                         latest["fileName"] if latest else "-"])
+        table(["Source", "ID", "Name", "Latest file"], rows)
+    else:
+        table(["Source", "ID", "Name", "Slug"],
+              [[m["source"], m["id"], m.get("name", ""), m.get("slug", "")] for m in mods])
     print(f"\n{len(mods)} mods in profile {name!r} "
           f"({prof.get('version') or 'any version'} / {prof.get('loader') or 'any loader'})")
 
@@ -387,24 +588,27 @@ def cmd_upgrade(args):
     if not mods:
         sys.exit(f"Profile {name!r} has no mods. Add some: cf add <mod>")
 
-    queue = [m["id"] for m in mods]
+    channel = prof.get("channel")
+    queue = [normalize_mod(m) for m in mods]
     seen, plan, filenames = set(), [], set()
     while queue:
-        mod_id = queue.pop(0)
-        if mod_id in seen:
+        mod = queue.pop(0)
+        key = (mod["source"], str(mod["id"]))
+        if key in seen:
             continue
-        seen.add(mod_id)
-        f = pick_file(mod_id, version, loader)
+        seen.add(key)
+        f = pick_any(mod, version, loader, channel)
         if not f:
-            print(f"skip     {mod_id}: no file for {version or 'any version'}/{loader or 'any loader'}")
+            print(f"skip     {mod.get('name') or mod['id']}: no file for "
+                  f"{version or 'any version'}/{loader or 'any loader'}")
             continue
         if f["fileName"] in filenames:
             continue
         filenames.add(f["fileName"])
         plan.append(f)
         for dep in f.get("dependencies") or []:
-            if dep.get("relationType") == 3 and dep["modId"] not in seen:
-                queue.append(dep["modId"])
+            if dep.get("required") and (dep["source"], str(dep["id"])) not in seen:
+                queue.append({"source": dep["source"], "id": dep["id"], "name": "", "slug": ""})
 
     out.mkdir(parents=True, exist_ok=True)
     missing = [f for f in plan if not (out / Path(f["fileName"]).name).exists()]
@@ -589,17 +793,20 @@ def cmd_install(args):
     prof = profile_defaults()
     version = args.version or prof.get("version")
     loader = args.loader or prof.get("loader")
+    channel = prof.get("channel")
     out = Path(args.dir or prof.get("dir") or default_mods_dir())
-    queue = [resolve_mod(args.mod, args.game)]
+    queue = [resolve_any(args.mod, args.source, args.game)]
     seen = set()
     while queue:
-        mod_id = queue.pop(0)
-        if mod_id in seen:
+        mod = queue.pop(0)
+        key = (mod["source"], str(mod["id"]))
+        if key in seen:
             continue
-        seen.add(mod_id)
-        f = pick_file(mod_id, version, loader)
+        seen.add(key)
+        f = pick_any(mod, version, loader, channel)
         if not f:
-            print(f"skip     mod {mod_id}: no file for {version or 'any version'}/{loader or 'any loader'}")
+            print(f"skip     {mod.get('name') or mod['id']}: no file for "
+                  f"{version or 'any version'}/{loader or 'any loader'}")
             continue
         dest = out / Path(f["fileName"]).name
         if args.dry_run:
@@ -611,8 +818,8 @@ def cmd_install(args):
             print(f"install  {dest.name}")
         if not args.no_deps:
             for dep in f.get("dependencies") or []:
-                if dep.get("relationType") == 3 and dep["modId"] not in seen:
-                    queue.append(dep["modId"])
+                if dep.get("required") and (dep["source"], str(dep["id"])) not in seen:
+                    queue.append({"source": dep["source"], "id": dep["id"], "name": "", "slug": ""})
     if args.dry_run:
         print("\n(dry run, nothing downloaded)")
     print(f"\nMods dir: {out}")
@@ -663,6 +870,23 @@ def cmd_scan(args):
     print(f"\n{len(rows)} matched, {len(unknown)} unknown")
     for name in unknown:
         print(f"  ? {name}")
+    if args.add:
+        profile_name, cfg, prof = active_profile(args)
+        existing = {(m.get("source", "curseforge"), str(m["id"])) for m in prof.get("mods") or []}
+        added = 0
+        for m in res["exactMatches"]:
+            f = m["file"]
+            key = ("curseforge", str(f["modId"]))
+            if key in existing:
+                continue
+            prof.setdefault("mods", []).append({
+                "source": "curseforge", "id": f["modId"],
+                "name": f.get("displayName", ""), "slug": "",
+            })
+            existing.add(key)
+            added += 1
+        save_config(cfg)
+        print(f"{added} added to profile {profile_name!r}")
 
 
 def install_pack(pack, dest=None):
@@ -705,6 +929,98 @@ def cmd_pack(args):
         sys.exit("No files match those filters.")
     print(f"Downloading {f['displayName']} ({human(f.get('fileLength'))}B)")
     install_pack(download_file(f, args.out), args.dir)
+
+
+def cmd_modpack_add(args):
+    mod = cf_mod(args.mod, MINECRAFT)
+    f = pick_file(mod["id"], args.version, args.loader)
+    if not f:
+        sys.exit("No files match those filters.")
+    name = args.name or mod["name"]
+    out = Path(args.dir or name)
+    print(f"Downloading {f['displayName']} ({human(f.get('fileLength'))}B)")
+    zip_path = download_file(f, args.out or "downloads")
+    install_pack(zip_path, out)
+    cfg = load_config()
+    cfg.setdefault("modpacks", {})[name] = {
+        "id": mod["id"], "name": mod["name"], "dir": str(out.resolve()),
+        "fileId": f["id"], "version": args.version, "loader": args.loader,
+    }
+    if args.use or not cfg.get("active_modpack"):
+        cfg["active_modpack"] = name
+    save_config(cfg)
+    print(f"Registered modpack {name!r}")
+
+
+def cmd_modpack_list(args):
+    cfg = load_config()
+    modpacks = cfg.get("modpacks") or {}
+    if not modpacks:
+        print("No modpacks. Install one: cf modpack add <id-or-slug>")
+        return
+    table(["", "Name", "ID", "Directory"], [
+        ["*" if n == cfg.get("active_modpack") else "", n, p.get("id"), p.get("dir", "")]
+        for n, p in modpacks.items()
+    ])
+
+
+def cmd_modpack_info(args):
+    name = args.name or load_config().get("active_modpack")
+    if not name:
+        sys.exit("No active modpack. See: cf modpack list")
+    cfg = load_config()
+    packs = cfg.get("modpacks") or {}
+    if name not in packs:
+        sys.exit(f"No modpack named {name!r}")
+    p = packs[name]
+    print(f"{name} (id {p['id']})")
+    print(f"Directory : {p.get('dir')}")
+    print(f"File      : {p.get('fileId')}  "
+          f"{p.get('version') or 'any version'} / {p.get('loader') or 'any loader'}")
+
+
+def cmd_modpack_upgrade(args):
+    name = args.name or load_config().get("active_modpack")
+    if not name:
+        sys.exit("No active modpack. See: cf modpack list")
+    cfg = load_config()
+    packs = cfg.get("modpacks") or {}
+    if name not in packs:
+        sys.exit(f"No modpack named {name!r}")
+    p = packs[name]
+    f = pick_file(p["id"], p.get("version"), p.get("loader"))
+    if not f:
+        sys.exit("No files match those filters.")
+    if f["id"] == p.get("fileId"):
+        print(f"{name} is up to date ({f['fileName']})")
+        return
+    print(f"Upgrading {name} -> {f['fileName']}")
+    zip_path = download_file(f, args.out or "downloads")
+    install_pack(zip_path, p["dir"])
+    p["fileId"] = f["id"]
+    save_config(cfg)
+    print(f"Updated modpack {name!r}")
+
+
+def cmd_modpack_delete(args):
+    cfg = load_config()
+    packs = cfg.get("modpacks") or {}
+    if args.name not in packs:
+        sys.exit(f"No modpack named {args.name!r}")
+    del packs[args.name]
+    if cfg.get("active_modpack") == args.name:
+        cfg["active_modpack"] = next(iter(packs), None)
+    save_config(cfg)
+    print(f"Removed modpack {args.name!r} (files left in place)")
+
+
+def cmd_modpack_switch(args):
+    cfg = load_config()
+    if args.name not in (cfg.get("modpacks") or {}):
+        sys.exit(f"No modpack named {args.name!r}")
+    cfg["active_modpack"] = args.name
+    save_config(cfg)
+    print(f"Active modpack: {args.name}")
 
 
 def cmd_worlds(args):
@@ -769,10 +1085,19 @@ def main(argv=None):
     s.add_argument("name")
     s.add_argument("--version", help="game version, e.g. 1.21.1")
     s.add_argument("--loader", choices=LOADERS)
+    s.add_argument("--channel", choices=["release", "beta", "alpha", "any"])
     s.add_argument("--dir", help="mods directory")
     s.add_argument("--game", type=int, default=MINECRAFT)
     s.add_argument("--use", action="store_true", help="make it the active profile")
     s.set_defaults(func=cmd_profile_create)
+
+    s = psub.add_parser("configure", help="change profile settings")
+    s.add_argument("name")
+    s.add_argument("--version")
+    s.add_argument("--loader", choices=LOADERS)
+    s.add_argument("--channel", choices=["release", "beta", "alpha", "any"])
+    s.add_argument("--dir")
+    s.set_defaults(func=cmd_profile_configure)
 
     s = psub.add_parser("list", help="list profiles")
     s.set_defaults(func=cmd_profile_list)
@@ -871,7 +1196,8 @@ def main(argv=None):
     sp.set_defaults(func=cmd_download)
 
     sp = add("install", cmd_install, "install a mod and its required dependencies")
-    sp.add_argument("mod", help="mod id or slug")
+    sp.add_argument("mod", help="CurseForge id/slug, Modrinth id/slug, or owner/repo")
+    sp.add_argument("--source", choices=["auto", "curseforge", "modrinth", "github"], default="auto")
     sp.add_argument("--game", type=int, default=MINECRAFT)
     sp.add_argument("--version")
     sp.add_argument("--loader", choices=LOADERS)
@@ -887,8 +1213,9 @@ def main(argv=None):
     sp.add_argument("--dry-run", action="store_true", help="only report available updates")
 
     sp = add("add", cmd_add, "add mods to the active profile")
-    sp.add_argument("mods", nargs="+", help="mod ids or slugs")
+    sp.add_argument("mods", nargs="+", help="CurseForge id/slug, Modrinth id/slug, or owner/repo")
     sp.add_argument("--profile")
+    sp.add_argument("--source", choices=["auto", "curseforge", "modrinth", "github"], default="auto")
     sp.add_argument("--force", action="store_true", help="skip the compatibility check")
 
     sp = add("remove", cmd_remove, "remove mods from the active profile")
@@ -897,6 +1224,8 @@ def main(argv=None):
 
     sp = add("list", cmd_list, "list mods in the active profile")
     sp.add_argument("--profile")
+    sp.add_argument("--verbose", action="store_true", help="resolve the latest file for each mod")
+    sp.add_argument("--markdown", action="store_true", help="markdown table, alphabetical")
 
     sp = add("upgrade", cmd_upgrade, "download latest compatible versions for the profile")
     sp.add_argument("--profile")
@@ -909,6 +1238,8 @@ def main(argv=None):
     sp.add_argument("path", help="a .jar file or a folder of jars")
     sp.add_argument("--game", type=int, default=MINECRAFT)
     sp.add_argument("--fuzzy", action="store_true", help="fuzzy folder match (raw JSON)")
+    sp.add_argument("--add", action="store_true", help="add matched mods to the active profile")
+    sp.add_argument("--profile")
 
     sp = add("import", cmd_import, "install a CurseForge modpack zip")
     sp.add_argument("pack", help="modpack .zip")
@@ -921,6 +1252,39 @@ def main(argv=None):
     sp.add_argument("--loader", choices=LOADERS)
     sp.add_argument("--out", default="downloads", help="where to save the pack zip")
     sp.add_argument("--dir", help="target folder (default: ./<pack name>)")
+
+    sp = add("modpack", cmd_modpack_list, "manage installed modpacks")
+    msub = sp.add_subparsers(dest="modpack_cmd", required=True)
+
+    s = msub.add_parser("add", help="install and track a CurseForge modpack")
+    s.add_argument("mod", help="modpack id or slug")
+    s.add_argument("--name", help="local name (default: project name)")
+    s.add_argument("--version")
+    s.add_argument("--loader", choices=LOADERS)
+    s.add_argument("--dir", help="target folder (default: ./<name>)")
+    s.add_argument("--out", default="downloads", help="where to save the pack zip")
+    s.add_argument("--use", action="store_true", help="make it the active modpack")
+    s.set_defaults(func=cmd_modpack_add)
+
+    s = msub.add_parser("list", help="list tracked modpacks")
+    s.set_defaults(func=cmd_modpack_list)
+
+    s = msub.add_parser("info", help="show a modpack")
+    s.add_argument("name", nargs="?")
+    s.set_defaults(func=cmd_modpack_info)
+
+    s = msub.add_parser("upgrade", help="upgrade a tracked modpack")
+    s.add_argument("name", nargs="?")
+    s.add_argument("--out", default="downloads", help="where to save the pack zip")
+    s.set_defaults(func=cmd_modpack_upgrade)
+
+    s = msub.add_parser("delete", help="stop tracking a modpack (files untouched)")
+    s.add_argument("name")
+    s.set_defaults(func=cmd_modpack_delete)
+
+    s = msub.add_parser("switch", help="set the active modpack")
+    s.add_argument("name")
+    s.set_defaults(func=cmd_modpack_switch)
 
     sp = add("worlds", cmd_worlds, "list local Minecraft worlds")
     sp.add_argument("--dir", help="saves directory (default: %%APPDATA%%\\.minecraft\\saves)")

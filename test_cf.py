@@ -103,7 +103,7 @@ class TestCf(unittest.TestCase):
             Path(dest).write_bytes(b"jar")
 
         with tempfile.TemporaryDirectory() as tmp, mock.patch("urllib.request.urlretrieve", side_effect=fake_download) as download:
-            self.run_cli(["install", "foo", "--dir", tmp], *payloads)
+            self.run_cli(["install", "foo", "--source", "curseforge", "--dir", tmp], *payloads)
             self.assertEqual(download.call_count, 2)
             self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), ["a.jar", "b.jar"])
 
@@ -163,6 +163,79 @@ class TestCf(unittest.TestCase):
                 self.run_cli(["upgrade"], *payloads)
             self.assertTrue((Path(tmp) / "a.jar").exists())
 
+    def test_add_modrinth_mod(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.json"
+            config.write_text(json.dumps({"active_profile": "p", "profiles": {"p": {
+                "version": "1.21.1", "loader": "fabric", "dir": tmp, "mods": []}}}))
+            payloads = [
+                {"id": "AANobbMI", "slug": "sodium", "title": "Sodium", "project_type": "mod"},
+                [{"id": "ver1", "version_type": "release", "date_published": "2026-01-01",
+                  "name": "1.0", "game_versions": ["1.21.1"], "loaders": ["fabric"],
+                  "files": [{"primary": True, "filename": "sodium.jar", "url": "https://x/s.jar",
+                             "hashes": {"sha1": "abc"}, "size": 1}],
+                  "dependencies": []}],
+            ]
+            with mock.patch.object(cf, "CONFIG", config):
+                self.run_cli(["add", "sodium"], *payloads)
+            data = json.loads(config.read_text())
+            self.assertEqual(data["profiles"]["p"]["mods"][0]["source"], "modrinth")
+            self.assertEqual(data["profiles"]["p"]["mods"][0]["id"], "AANobbMI")
+
+    def test_add_github_repo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.json"
+            config.write_text(json.dumps({"active_profile": "p", "profiles": {"p": {
+                "version": "1.21.1", "loader": "fabric", "dir": tmp, "mods": []}}}))
+            payloads = [
+                {"full_name": "owner/repo", "name": "repo"},
+                [{"id": 1, "name": "v1.0", "tag_name": "v1.0", "body": "for 1.21.1 fabric",
+                  "prerelease": False, "published_at": "2026-01-01",
+                  "assets": [{"name": "repo.jar", "size": 10,
+                              "browser_download_url": "https://x/r.jar"}]}],
+            ]
+            with mock.patch.object(cf, "CONFIG", config):
+                self.run_cli(["add", "owner/repo"], *payloads)
+            data = json.loads(config.read_text())
+            self.assertEqual(data["profiles"]["p"]["mods"][0]["source"], "github")
+
+    def test_github_version_boundary(self):
+        releases = [{"id": 1, "name": "v1", "tag_name": "v1", "body": "for 1.21.11",
+                     "prerelease": False, "published_at": "2026-01-01",
+                     "assets": [{"name": "mod-fabric-1.21.11.jar", "size": 1,
+                                 "browser_download_url": "https://x/m.jar"}]}]
+        with mock.patch.object(cf, "github", return_value=releases):
+            self.assertIsNone(cf.github_pick("owner/repo", "1.21.1", "fabric"))
+            self.assertIsNotNone(cf.github_pick("owner/repo", "1.21.11", "fabric"))
+
+    def test_modpack_add_registers_pack(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.json"
+            config.write_text(json.dumps({}))
+            pack_zip = Path(tmp) / "pack.zip"
+            manifest = {"name": "Pack", "version": "1.0",
+                        "minecraft": {"version": "1.21.1", "modLoaders": [{"id": "fabric-0.16.0"}]},
+                        "files": []}
+            with zipfile.ZipFile(pack_zip, "w") as z:
+                z.writestr("manifest.json", json.dumps(manifest))
+            payloads = [
+                {"data": {"id": 99, "name": "Pack"}},
+                {"data": [{"id": 7, "modId": 99, "fileName": "pack.zip", "displayName": "Pack 1.0",
+                           "fileLength": 10, "dependencies": []}]},
+                {"data": "https://example.test/pack.zip"},
+            ]
+
+            def fake_download(req, dest):
+                Path(dest).write_bytes(pack_zip.read_bytes())
+
+            out = Path(tmp) / "instance"
+            with mock.patch.object(cf, "CONFIG", config), \
+                    mock.patch("urllib.request.urlretrieve", side_effect=fake_download):
+                self.run_cli(["modpack", "add", "99", "--dir", str(out)], *payloads)
+            data = json.loads(config.read_text())
+            self.assertEqual(data["modpacks"]["Pack"]["id"], 99)
+            self.assertEqual(data["active_modpack"], "Pack")
+
     def test_retry_on_429(self):
         calls = []
 
@@ -197,8 +270,11 @@ class TestCf(unittest.TestCase):
             self.assertEqual(list(Path(tmp).iterdir()), [])
 
     def test_install_dry_run_writes_nothing(self):
-        payloads = [{"data": [{"id": 10, "modId": 1, "fileName": "a.jar",
-                               "displayName": "A", "dependencies": []}]}]
+        payloads = [
+            {"data": {"id": 1, "name": "A"}},
+            {"data": [{"id": 10, "modId": 1, "fileName": "a.jar",
+                       "displayName": "A", "dependencies": []}]},
+        ]
         with tempfile.TemporaryDirectory() as tmp, mock.patch("urllib.request.urlretrieve") as download:
             self.run_cli(["install", "1", "--dir", tmp, "--dry-run"], *payloads)
             download.assert_not_called()
